@@ -1,131 +1,246 @@
 var THREEx = THREEx || {}
 
-THREEx.ArPatternFile = {}
+THREEx.ArMarkerControls = function(context, object3d, parameters){
+	var _this = this
 
-THREEx.ArPatternFile.toCanvas = function(patternFileString, onComplete){
-	console.assert(false, 'not yet implemented')
-}
+	THREEx.ArBaseControls.call(this, object3d)
 
-//////////////////////////////////////////////////////////////////////////////
-//		function to encode image
-//////////////////////////////////////////////////////////////////////////////
-
-THREEx.ArPatternFile.encodeImageURL = function(imageURL, onComplete){
-	var image = new Image;
-	image.onload = function(){
-		var patternFileString = THREEx.ArPatternFile.encodeImage(image)
-		onComplete(patternFileString)
+	this.context = context
+	// handle default parameters
+	this.parameters = {
+		// size of the marker in meter
+		size : 1,
+		// type of marker - ['pattern', 'barcode', 'unknown' ]
+		type : 'unknown',
+		// url of the pattern - IIF type='pattern'
+		patternUrl : null,
+		// value of the barcode - IIF type='barcode'
+		barcodeValue : null,
+		// change matrix mode - [modelViewMatrix, cameraTransformMatrix]
+		changeMatrixMode : 'modelViewMatrix',
+		// minimal confidence in the marke recognition - between [0, 1] - default to 1
+		minConfidence: 0.6,
 	}
-	image.src = imageURL;
-}
 
-THREEx.ArPatternFile.encodeImage = function(image){
-	// copy image on canvas
-	var canvas = document.createElement('canvas');
-	var context = canvas.getContext('2d')
-	canvas.width = 16;
-	canvas.height = 16;
-
-	// document.body.appendChild(canvas)
-	// canvas.style.width = '200px'
+	// sanity check
+	var possibleValues = ['pattern', 'barcode', 'unknown']
+	console.assert(possibleValues.indexOf(this.parameters.type) !== -1, 'illegal value', this.parameters.type)
+	var possibleValues = ['modelViewMatrix', 'cameraTransformMatrix' ]
+	console.assert(possibleValues.indexOf(this.parameters.changeMatrixMode) !== -1, 'illegal value', this.parameters.changeMatrixMode)
 
 
-	var patternFileString = ''
-	for(var orientation = 0; orientation > -2*Math.PI; orientation -= Math.PI/2){
-		// draw on canvas - honor orientation
-		context.save();
- 		context.clearRect(0,0,canvas.width,canvas.height);
-		context.translate(canvas.width/2,canvas.height/2);
-		context.rotate(orientation);
-		context.drawImage(image, -canvas.width/2,-canvas.height/2, canvas.width, canvas.height);
-		context.restore();
+        // create the marker Root
+	this.object3d = object3d
+	this.object3d.matrixAutoUpdate = false;
+	this.object3d.visible = false
 
-		// get imageData
-		var imageData = context.getImageData(0, 0, canvas.width, canvas.height)
+	//////////////////////////////////////////////////////////////////////////////
+	//		setParameters
+	//////////////////////////////////////////////////////////////////////////////
+	setParameters(parameters)
+	function setParameters(parameters){
+		if( parameters === undefined )	return
+		for( var key in parameters ){
+			var newValue = parameters[ key ]
 
-		// generate the patternFileString for this orientation
-		if( orientation !== 0 )	patternFileString += '\n'
-		// NOTE bgr order and not rgb!!! so from 2 to 0
-		for(var channelOffset = 2; channelOffset >= 0; channelOffset--){
-			// console.log('channelOffset', channelOffset)
-			for(var y = 0; y < imageData.height; y++){
-				for(var x = 0; x < imageData.width; x++){
-
-					if( x !== 0 ) patternFileString += ' '
-
-					var offset = (y*imageData.width*4) + (x * 4) + channelOffset
-					var value = imageData.data[offset]
-
-					patternFileString += String(value).padStart(3);
-				}
-				patternFileString += '\n'
+			if( newValue === undefined ){
+				console.warn( "THREEx.ArMarkerControls: '" + key + "' parameter is undefined." )
+				continue
 			}
+
+			var currentValue = _this.parameters[ key ]
+
+			if( currentValue === undefined ){
+				console.warn( "THREEx.ArMarkerControls: '" + key + "' is not a property of this material." )
+				continue
+			}
+
+			_this.parameters[ key ] = newValue
 		}
 	}
 
-	return patternFileString
+	//////////////////////////////////////////////////////////////////////////////
+	//		Code Separator
+	//////////////////////////////////////////////////////////////////////////////
+	// add this marker to artoolkitsystem
+	// TODO rename that .addMarkerControls
+	context.addMarker(this)
+
+	if( _this.context.parameters.trackingBackend === 'artoolkit' ){
+		this._initArtoolkit()
+	}else if( _this.context.parameters.trackingBackend === 'aruco' ){
+		// TODO create a ._initAruco
+		// put aruco second
+		this._arucoPosit = new POS.Posit(this.parameters.size, _this.context.arucoContext.canvas.width)
+	}else if( _this.context.parameters.trackingBackend === 'tango' ){
+		this._initTango()
+	}else console.assert(false)
+}
+
+THREEx.ArMarkerControls.prototype = Object.create( THREEx.ArBaseControls.prototype );
+THREEx.ArMarkerControls.prototype.constructor = THREEx.ArMarkerControls;
+
+THREEx.ArMarkerControls.prototype.dispose = function(){
+	this.context.removeMarker(this)
+
+	// TODO remove the event listener if needed
+	// unloadMaker ???
 }
 
 //////////////////////////////////////////////////////////////////////////////
-//		trigger download
+//		update controls with new modelViewMatrix
 //////////////////////////////////////////////////////////////////////////////
 
-THREEx.ArPatternFile.triggerDownload =  function(patternFileString, fileName = 'pattern-marker.patt'){
-	// tech from https://stackoverflow.com/questions/3665115/create-a-file-in-memory-for-user-to-download-not-through-server
-	var domElement = window.document.createElement('a');
-	domElement.href = window.URL.createObjectURL(new Blob([patternFileString], {type: 'text/plain'}));
-	domElement.download = fileName;
-	document.body.appendChild(domElement)
-	domElement.click();
-	document.body.removeChild(domElement)
+/**
+ * When you actually got a new modelViewMatrix, you need to perfom a whole bunch
+ * of things. it is done here.
+ */
+THREEx.ArMarkerControls.prototype.updateWithModelViewMatrix = function(modelViewMatrix){
+	var markerObject3D = this.object3d;
+
+	// mark object as visible
+	markerObject3D.visible = true
+
+	if( this.context.parameters.trackingBackend === 'artoolkit' ){
+		// apply context._axisTransformMatrix - change artoolkit axis to match usual webgl one
+		var tmpMatrix = new THREE.Matrix4().copy(this.context._artoolkitProjectionAxisTransformMatrix)
+		tmpMatrix.multiply(modelViewMatrix)
+
+		modelViewMatrix.copy(tmpMatrix)
+	}else if( this.context.parameters.trackingBackend === 'aruco' ){
+		// ...
+	}else if( this.context.parameters.trackingBackend === 'tango' ){
+		// ...
+	}else console.assert(false)
+
+
+	if( this.context.parameters.trackingBackend !== 'tango' ){
+
+		// change axis orientation on marker - artoolkit say Z is normal to the marker - ar.js say Y is normal to the marker
+		var markerAxisTransformMatrix = new THREE.Matrix4().makeRotationX(Math.PI/2)
+		modelViewMatrix.multiply(markerAxisTransformMatrix)
+	}
+
+	// change markerObject3D.matrix based on parameters.changeMatrixMode
+	if( this.parameters.changeMatrixMode === 'modelViewMatrix' ){
+		markerObject3D.matrix.copy(modelViewMatrix)
+	}else if( this.parameters.changeMatrixMode === 'cameraTransformMatrix' ){
+		markerObject3D.matrix.getInverse( modelViewMatrix )
+	}else {
+		console.assert(false)
+	}
+
+	// decompose - the matrix into .position, .quaternion, .scale
+	markerObject3D.matrix.decompose(markerObject3D.position, markerObject3D.quaternion, markerObject3D.scale)
+
+	// dispatchEvent
+	this.dispatchEvent( { type: 'markerFound' } );
 }
 
-THREEx.ArPatternFile.buildFullMarker =  function(innerImageURL, pattRatio, size, color, onComplete){
-	var whiteMargin = 0.1
-	var blackMargin = (1 - 2 * whiteMargin) * ((1-pattRatio)/2)
-	// var blackMargin = 0.2
+//////////////////////////////////////////////////////////////////////////////
+//		utility functions
+//////////////////////////////////////////////////////////////////////////////
 
-	var innerMargin = whiteMargin + blackMargin
+/**
+ * provide a name for a marker
+ * - silly heuristic for now
+ * - should be improved
+ */
+THREEx.ArMarkerControls.prototype.name = function(){
+	var name = ''
+	name += this.parameters.type;
+	if( this.parameters.type === 'pattern' ){
+		var url = this.parameters.patternUrl
+		var basename = url.replace(/^.*\//g, '')
+		name += ' - ' + basename
+	}else if( this.parameters.type === 'barcode' ){
+		name += ' - ' + this.parameters.barcodeValue
+	}else{
+		console.assert(false, 'no .name() implemented for this marker controls')
+	}
+	return name
+}
 
-	var canvas = document.createElement('canvas');
-	var context = canvas.getContext('2d')
-	canvas.width = canvas.height = size
+//////////////////////////////////////////////////////////////////////////////
+//		init for Artoolkit
+//////////////////////////////////////////////////////////////////////////////
+THREEx.ArMarkerControls.prototype._initArtoolkit = function(){
+	var _this = this
 
-	context.fillStyle = 'white';
-	context.fillRect(0,0,canvas.width, canvas.height)
+	var artoolkitMarkerId = null
 
-	// copy image on canvas
-	context.fillStyle = color;
-	context.fillRect(
-		whiteMargin * canvas.width,
-		whiteMargin * canvas.height,
-		canvas.width * (1-2*whiteMargin),
-		canvas.height * (1-2*whiteMargin)
-	);
+	var delayedInitTimerId = setInterval(function(){
+		// check if arController is init
+		var arController = _this.context.arController
+		if( arController === null )	return
+		// stop looping if it is init
+		clearInterval(delayedInitTimerId)
+		delayedInitTimerId = null
+		// launch the _postInitArtoolkit
+		postInit()
+	}, 1000/50)
 
-	// clear the area for innerImage (in case of transparent image)
-	context.fillStyle = 'white';
-	context.fillRect(
-		innerMargin * canvas.width,
-		innerMargin * canvas.height,
-		canvas.width * (1-2*innerMargin),
-		canvas.height * (1-2*innerMargin)
-	);
+	return
 
+	function postInit(){
+		// check if arController is init
+		var arController = _this.context.arController
+		console.assert(arController !== null )
 
-	// display innerImage in the middle
-	var innerImage = document.createElement('img')
-	innerImage.addEventListener('load', function(){
-		// draw innerImage
-		context.drawImage(innerImage,
-			innerMargin * canvas.width,
-			innerMargin * canvas.height,
-			canvas.width * (1-2*innerMargin),
-			canvas.height * (1-2*innerMargin)
-		);
+        arController.setPattRatio(0.9);
 
-		var imageUrl = canvas.toDataURL()
-		onComplete(imageUrl)
-	})
-	innerImage.src = innerImageURL
+		// start tracking this pattern
+		if( _this.parameters.type === 'pattern' ){
+	                arController.loadMarker(_this.parameters.patternUrl, function(markerId) {
+				artoolkitMarkerId = markerId
+	                        arController.trackPatternMarkerId(artoolkitMarkerId, _this.parameters.size);
+	                });
+		}else if( _this.parameters.type === 'barcode' ){
+			artoolkitMarkerId = _this.parameters.barcodeValue
+			arController.trackBarcodeMarkerId(artoolkitMarkerId, _this.parameters.size);
+		}else if( _this.parameters.type === 'unknown' ){
+			artoolkitMarkerId = null
+		}else{
+			console.log(false, 'invalid marker type', _this.parameters.type)
+		}
+
+		// listen to the event
+		arController.addEventListener('getMarker', function(event){
+			if( event.data.type === artoolkit.PATTERN_MARKER && _this.parameters.type === 'pattern' ){
+				if( artoolkitMarkerId === null )	return
+				if( event.data.marker.idPatt === artoolkitMarkerId ) onMarkerFound(event)
+			}else if( event.data.type === artoolkit.BARCODE_MARKER && _this.parameters.type === 'barcode' ){
+				// console.log('BARCODE_MARKER idMatrix', event.data.marker.idMatrix, artoolkitMarkerId )
+				if( artoolkitMarkerId === null )	return
+				if( event.data.marker.idMatrix === artoolkitMarkerId )  onMarkerFound(event)
+			}else if( event.data.type === artoolkit.UNKNOWN_MARKER && _this.parameters.type === 'unknown'){
+				onMarkerFound(event)
+			}
+		})
+
+	}
+
+	function onMarkerFound(event){
+		// honor his.parameters.minConfidence
+		if( event.data.type === artoolkit.PATTERN_MARKER && event.data.marker.cfPatt < _this.parameters.minConfidence )	return
+		if( event.data.type === artoolkit.BARCODE_MARKER && event.data.marker.cfMatt < _this.parameters.minConfidence )	return
+
+		var modelViewMatrix = new THREE.Matrix4().fromArray(event.data.matrix)
+		_this.updateWithModelViewMatrix(modelViewMatrix)
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//		aruco specific
+//////////////////////////////////////////////////////////////////////////////
+THREEx.ArMarkerControls.prototype._initAruco = function(){
+	this._arucoPosit = new POS.Posit(this.parameters.size, _this.context.arucoContext.canvas.width)
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//		init for Artoolkit
+//////////////////////////////////////////////////////////////////////////////
+THREEx.ArMarkerControls.prototype._initTango = function(){
+	var _this = this
+	console.log('init tango ArMarkerControls')
 }
